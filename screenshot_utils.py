@@ -515,8 +515,16 @@ def load_crop_regions_config(
     source = str(data.get("source_image", "monitor_screenshot.png"))
 
     seats: dict[str, dict[str, Any]] = {}
+    _non_seat_keys = frozenset(
+        {
+            "source_image",
+            "street",
+            "street_preflop_ahash",
+            "street_preflop_hamming_max",
+        }
+    )
     for key, value in data.items():
-        if key == "source_image":
+        if key in _non_seat_keys:
             continue
         if not isinstance(value, dict):
             raise TypeError(f"Seat '{key}' must be an object with name and stack")

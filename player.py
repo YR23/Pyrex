@@ -15,7 +15,7 @@ SEAT_ORDER_CLOCKWISE = (
 )
 
 # Six-max labels starting at dealer (button), then clockwise.
-SIX_MAX_POSITIONS = ("BTN", "SB", "BB", "UTG", "MP", "CO")
+SIX_MAX_POSITIONS = ("BTN", "SB", "BB", "LJ", "HJ", "CO")
 
 
 def _split_rank_color(card: str) -> tuple[str, str]:
@@ -93,7 +93,7 @@ class Player:
 def assign_six_max_positions(players: list[Player]) -> None:
     """Set ``position`` from ``dealer`` and ``SEAT_ORDER_CLOCKWISE`` (6-max).
 
-    Dealer seat is BTN; next clockwise seats are SB, BB, UTG, MP, CO.
+    Dealer seat is BTN; next clockwise seats are SB, BB, LJ, HJ, CO.
     If no dealer is detected, every ``position`` stays ``?``.
     If multiple seats report ``dealer``, the first clockwise from ``top_middle`` wins.
     """

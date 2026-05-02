@@ -1,5 +1,6 @@
 {
   "source_image": "monitor_screenshot.png",
+  "street": {"x0": 2335, "y0": 589, "x1": 2842, "y1": 711},
   "top_left": {
     "name": { "x0": 1840, "y0": 430, "x1": 2075, "y1": 476 },
     "stack": {"x0": 1870, "y0": 477, "x1": 2040, "y1": 524},
