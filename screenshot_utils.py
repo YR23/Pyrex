@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import colorsys
 import json
 import re
 from pathlib import Path
 import subprocess
 from typing import Any, Literal, Union
+
+from consts import HERO_HAND_KEYS, HERO_SEAT
 import tkinter as tk
 
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
@@ -119,6 +122,79 @@ def crop_from_loaded_image(
     return image.crop((x0, y0, x1, y1))
 
 
+def dominant_hole_card_suit_color(card_crop: Image.Image) -> str:
+    """Dominant ink color in a single-card crop, ignoring near-white background.
+
+    Returns one of ``\"red\"``, ``\"green\"``, ``\"blue\"``, ``\"black\"`` for use
+    with rank labels (e.g. ``9-red``, ``7-blue``).
+    """
+    rgb = card_crop.convert("RGB")
+    w, h = rgb.size
+    if w * h > 4096:
+        rgb = rgb.resize(
+            (max(1, w // 2), max(1, h // 2)),
+            Image.Resampling.BILINEAR,
+        )
+
+    rf_list: list[float] = []
+    gf_list: list[float] = []
+    bf_list: list[float] = []
+
+    for r, g, b in rgb.getdata():
+        rf = r / 255.0
+        gf = g / 255.0
+        bf = b / 255.0
+        lum = 0.299 * rf + 0.587 * gf + 0.114 * bf
+        spread = max(rf, gf, bf) - min(rf, gf, bf)
+        if rf > 0.93 and gf > 0.93 and bf > 0.93:
+            continue
+        if lum > 0.88 and spread < 0.08:
+            continue
+        rf_list.append(rf)
+        gf_list.append(gf)
+        bf_list.append(bf)
+
+    if len(rf_list) < 10:
+        rf_list.clear()
+        gf_list.clear()
+        bf_list.clear()
+        for r, g, b in rgb.getdata():
+            rf, gf, bf = r / 255.0, g / 255.0, b / 255.0
+            if rf > 0.98 and gf > 0.98 and bf > 0.98:
+                continue
+            rf_list.append(rf)
+            gf_list.append(gf)
+            bf_list.append(bf)
+
+    if not rf_list:
+        return "black"
+
+    n = len(rf_list)
+    mr = sum(rf_list) / n
+    mg = sum(gf_list) / n
+    mb = sum(bf_list) / n
+    mh, ms, mv = colorsys.rgb_to_hsv(mr, mg, mb)
+
+    if mv < 0.24:
+        return "black"
+    if ms < 0.14 and mv < 0.5:
+        return "black"
+
+    if mh <= 0.05 or mh >= 0.95:
+        return "red"
+    if mh < 0.14 and ms > 0.12:
+        return "red"
+    if 0.16 <= mh <= 0.52:
+        return "green"
+    if 0.52 < mh < 0.78:
+        return "blue"
+    if 0.78 <= mh < 0.95:
+        return "red"
+    if 0.12 <= mh < 0.16:
+        return "green"
+    return "black"
+
+
 def is_player_name_active(
     name_image: Image.Image,
     *,
@@ -220,6 +296,54 @@ def recognize_table_action(action_crop: Image.Image) -> str:
     return ocr_variant(alt)
 
 
+_HOLE_CARD_WHITELIST = "0123456789AKQJTSHDC"
+
+
+def recognize_hole_card_crop(card_crop: Image.Image) -> str:
+    """OCR a single hole-card crop (rank + suit letters if Tesseract sees them)."""
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    allowed = frozenset(_HOLE_CARD_WHITELIST)
+
+    def clean(s: str) -> str:
+        return "".join(c.upper() for c in s if c.upper() in allowed)
+
+    def ocr_once(gray: Image.Image) -> str:
+        w, h = gray.size
+        scale = max(96 / max(h, 1), 96 / max(w, 1), 3.5)
+        if scale > 1.01:
+            gray = gray.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        best = ""
+        for psm in (10, 8, 7):
+            raw = pytesseract.image_to_string(
+                gray,
+                config=f"--psm {psm} -c tessedit_char_whitelist={_HOLE_CARD_WHITELIST}",
+            )
+            candidate = clean(raw)
+            if len(candidate) > len(best):
+                best = candidate
+        if not best:
+            for psm in (10, 8, 7):
+                raw = pytesseract.image_to_string(gray, config=f"--psm {psm}")
+                candidate = clean(raw)
+                if len(candidate) > len(best):
+                    best = candidate
+        return best
+
+    gray = card_crop.convert("L")
+    a = ocr_once(gray)
+    inv = ImageOps.invert(gray.copy())
+    inv = ImageEnhance.Contrast(inv).enhance(2.0)
+    b = ocr_once(inv)
+    return a if len(a) >= len(b) else b
+
+
 def pick_crop_coordinates(
     source_path: str | Path = "monitor_screenshot.png",
 ) -> tuple[int, int, int, int]:
@@ -306,11 +430,11 @@ def _parse_rect(region: object, path_hint: str) -> tuple[int, int, int, int]:
 def load_crop_regions_config(
     json_path: str | Path,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Load ``crop_regions.json`` with per-seat ``name``, ``stack``, optional ``dealer`` / ``action``.
+    """Load ``crop_regions.json`` with per-seat rects.
 
-    Top-level ``source_image`` (default ``monitor_screenshot.png``). Every other
-    top-level object is a *seat* with required ``name`` and ``stack`` rects; optional
-    ``dealer`` and ``action`` rects for dealer chip and action text (caps + ``-``).
+    Each seat needs ``name`` and ``stack``. Any other key whose value is an
+    ``{x0,y0,x1,y1}`` object is stored as an extra crop (e.g. ``dealer``, ``action``,
+    ``left_hand``, ``right_hand``).
     """
     path = Path(json_path).expanduser().resolve()
     if not path.exists():
@@ -331,10 +455,15 @@ def load_crop_regions_config(
             "name": _parse_rect(value["name"], f"{key}.name"),
             "stack": _parse_rect(value["stack"], f"{key}.stack"),
         }
-        if "dealer" in value:
-            seat["dealer"] = _parse_rect(value["dealer"], f"{key}.dealer")
-        if "action" in value:
-            seat["action"] = _parse_rect(value["action"], f"{key}.action")
+        for extra_key, extra_val in value.items():
+            if extra_key in ("name", "stack"):
+                continue
+            if extra_key in HERO_HAND_KEYS and key != HERO_SEAT:
+                continue
+            if isinstance(extra_val, dict) and all(
+                c in extra_val for c in ("x0", "y0", "x1", "y1")
+            ):
+                seat[extra_key] = _parse_rect(extra_val, f"{key}.{extra_key}")
         seats[key] = seat
 
     if not seats:

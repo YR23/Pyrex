@@ -7,13 +7,22 @@ from pathlib import Path
 
 from PIL import Image
 
+from consts import (
+    HERO_HAND_KEYS,
+    HERO_SEAT,
+    normalize_hole_card_ranks,
+    resolve_hole_card_rank,
+    resolve_table_action,
+)
 from player import Player, assign_six_max_positions
 from screenshot_utils import (
     crop_from_loaded_image,
     detect_dealer_marker,
+    dominant_hole_card_suit_color,
     is_player_name_active,
     load_crop_regions_config,
     pick_crop_coordinates,
+    recognize_hole_card_crop,
     recognize_table_action,
     recognize_text_from_image,
     screenshot_entire_monitor,
@@ -66,8 +75,44 @@ def _process_one_seat(
     if action_rect is not None:
         ax0, ay0, ax1, ay1 = action_rect
         action_image = safe_crop(ax0, ay0, ax1, ay1)
-        action = recognize_table_action(action_image)
+        action_raw = recognize_table_action(action_image)
+        action = resolve_table_action(action_raw)
         action_image.save(debug_dir / f"{seat_label}_action.png")
+
+    card_left = ""
+    card_right = ""
+    hole_cards = ""
+    if seat_label == HERO_SEAT:
+        for crop_key in HERO_HAND_KEYS:
+            rect = regions.get(crop_key)
+            if rect is None:
+                continue
+            if not isinstance(rect, tuple) or len(rect) != 4:
+                continue
+            x0, y0, x1, y1 = rect
+            extra_image = safe_crop(x0, y0, x1, y1)
+            extra_path = debug_dir / f"{seat_label}_{crop_key}.png"
+            extra_image.save(extra_path)
+            raw = recognize_hole_card_crop(extra_image)
+            if crop_key == "left_hand":
+                rank = resolve_hole_card_rank(raw)
+                suit = dominant_hole_card_suit_color(extra_image)
+                card_left = f"{rank}-{suit}" if rank else ""
+                resolved = card_left
+            elif crop_key == "right_hand":
+                rank = resolve_hole_card_rank(raw)
+                suit = dominant_hole_card_suit_color(extra_image)
+                card_right = f"{rank}-{suit}" if rank else ""
+                resolved = card_right
+            elif crop_key == "hero_hand":
+                hole_cards = normalize_hole_card_ranks(raw)
+                resolved = hole_cards
+            else:
+                resolved = ""
+            print(
+                f"[{seat_label}] Saved {crop_key}: {extra_path} "
+                f"(OCR: {raw!r} → {resolved!r})"
+            )
 
     name_debug_path = debug_dir / f"{seat_label}_name.png"
     stack_debug_path = debug_dir / f"{seat_label}_stack.png"
@@ -81,6 +126,9 @@ def _process_one_seat(
         active=active,
         dealer=dealer,
         action=action,
+        card_left=card_left,
+        card_right=card_right,
+        hole_cards=hole_cards,
     )
     return player, name_debug_path, stack_debug_path
 
@@ -178,6 +226,18 @@ def main() -> None:
         print(f"[{player.seat}] Position: {player.position}")
         action_show = player.action if player.action else "—"
         print(f"[{player.seat}] Action: {action_show}")
+        if player.seat == HERO_SEAT and (
+            player.card_left or player.card_right or player.hole_cards
+        ):
+            print(
+                f"[{player.seat}] Hole cards — left: {player.card_left or '—'} | "
+                f"right: {player.card_right or '—'}"
+                + (
+                    f" | combined: {player.hole_cards}"
+                    if player.hole_cards
+                    else ""
+                )
+            )
         print(
             f"[{player.seat}] Debug crops: {name_debug_path} , {stack_debug_path}"
         )

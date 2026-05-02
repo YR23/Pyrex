@@ -29,6 +29,9 @@ class Player:
     dealer: bool = False
     position: str = "?"
     action: str = ""
+    card_left: str = ""
+    card_right: str = ""
+    hole_cards: str = ""
 
     @property
     def status(self) -> str:
