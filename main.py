@@ -8,16 +8,19 @@ from pathlib import Path
 from PIL import Image
 
 from consts import (
-    HERO_HAND_KEYS,
+    HERO_HAND_OCR_ORDER,
     HERO_SEAT,
     normalize_hole_card_ranks,
     resolve_hole_card_rank,
+    resolve_hole_card_rank_at_least,
     resolve_table_action,
 )
+from hand_session import DEFAULT_SESSION_PATH, TableSessionTracker
 from player import Player, assign_six_max_positions
 from screenshot_utils import (
     crop_from_loaded_image,
     detect_dealer_marker,
+    detect_hero_my_turn_from_strip,
     dominant_hole_card_suit_color,
     is_player_name_active,
     load_crop_regions_config,
@@ -43,10 +46,9 @@ def _process_one_seat(
     base: Image.Image,
     seat_label: str,
     regions: dict,
-    debug_dir: Path,
     crop_lock: threading.Lock,
-) -> tuple[Player, Path, Path]:
-    """Crop one seat, OCR name/stack, optional dealer marker, save debug PNGs."""
+) -> Player:
+    """Crop one seat in memory, OCR name/stack, optional dealer marker, and hero extras."""
 
     def safe_crop(x0: int, y0: int, x1: int, y1: int) -> Image.Image:
         with crop_lock:
@@ -68,7 +70,6 @@ def _process_one_seat(
         dx0, dy0, dx1, dy1 = dealer_rect
         dealer_image = safe_crop(dx0, dy0, dx1, dy1)
         dealer = detect_dealer_marker(dealer_image)
-        dealer_image.save(debug_dir / f"{seat_label}_dealer.png")
 
     action = ""
     action_rect = regions.get("action")
@@ -77,13 +78,14 @@ def _process_one_seat(
         action_image = safe_crop(ax0, ay0, ax1, ay1)
         action_raw = recognize_table_action(action_image)
         action = resolve_table_action(action_raw)
-        action_image.save(debug_dir / f"{seat_label}_action.png")
 
     card_left = ""
     card_right = ""
     hole_cards = ""
+    my_turn = False
     if seat_label == HERO_SEAT:
-        for crop_key in HERO_HAND_KEYS:
+        right_rank_floor = ""
+        for crop_key in HERO_HAND_OCR_ORDER:
             rect = regions.get(crop_key)
             if rect is None:
                 continue
@@ -91,16 +93,19 @@ def _process_one_seat(
                 continue
             x0, y0, x1, y1 = rect
             extra_image = safe_crop(x0, y0, x1, y1)
-            extra_path = debug_dir / f"{seat_label}_{crop_key}.png"
-            extra_image.save(extra_path)
             raw = recognize_hole_card_crop(extra_image)
             if crop_key == "left_hand":
-                rank = resolve_hole_card_rank(raw)
+                rank = (
+                    resolve_hole_card_rank_at_least(raw, right_rank_floor)
+                    if right_rank_floor
+                    else resolve_hole_card_rank(raw)
+                )
                 suit = dominant_hole_card_suit_color(extra_image)
                 card_left = f"{rank}-{suit}" if rank else ""
                 resolved = card_left
             elif crop_key == "right_hand":
                 rank = resolve_hole_card_rank(raw)
+                right_rank_floor = rank
                 suit = dominant_hole_card_suit_color(extra_image)
                 card_right = f"{rank}-{suit}" if rank else ""
                 resolved = card_right
@@ -109,15 +114,14 @@ def _process_one_seat(
                 resolved = hole_cards
             else:
                 resolved = ""
-            print(
-                f"[{seat_label}] Saved {crop_key}: {extra_path} "
-                f"(OCR: {raw!r} → {resolved!r})"
-            )
+            print(f"[{seat_label}] {crop_key}: OCR {raw!r} → {resolved!r}")
 
-    name_debug_path = debug_dir / f"{seat_label}_name.png"
-    stack_debug_path = debug_dir / f"{seat_label}_stack.png"
-    name_image.save(name_debug_path)
-    stack_image.save(stack_debug_path)
+        my_turn_rect = regions.get("my_turn")
+        if my_turn_rect is not None and isinstance(my_turn_rect, tuple) and len(my_turn_rect) == 4:
+            mx0, my0, mx1, my1 = my_turn_rect
+            my_turn_image = safe_crop(mx0, my0, mx1, my1)
+            my_turn = detect_hero_my_turn_from_strip(my_turn_image)
+            print(f"[{seat_label}] my_turn: {my_turn}")
 
     player = Player(
         seat=seat_label,
@@ -129,8 +133,9 @@ def _process_one_seat(
         card_left=card_left,
         card_right=card_right,
         hole_cards=hole_cards,
+        my_turn=my_turn,
     )
-    return player, name_debug_path, stack_debug_path
+    return player
 
 
 def main() -> None:
@@ -197,26 +202,24 @@ def main() -> None:
     with Image.open(image_path) as monitor_image:
         base = monitor_image.copy()
 
-    debug_dir = repo_root / "debug_crops"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
     seat_items = list(seats.items())
     max_workers = min(8, len(seat_items)) if seat_items else 1
     crop_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
-            pool.submit(
-                _process_one_seat, base, seat_label, regions, debug_dir, crop_lock
-            )
+            pool.submit(_process_one_seat, base, seat_label, regions, crop_lock)
             for seat_label, regions in seat_items
         ]
-        rows: list[tuple[Player, Path, Path]] = [fut.result() for fut in futures]
+        players: list[Player] = [fut.result() for fut in futures]
 
-    players = [p for p, _, _ in rows]
     assign_six_max_positions(players)
 
-    for player, name_debug_path, stack_debug_path in rows:
+    session = TableSessionTracker.load(DEFAULT_SESSION_PATH)
+    session.ingest(players)
+    saved_session = session.save(DEFAULT_SESSION_PATH)
+
+    for player in players:
         print(f"[{player.seat}] Player: {player.name}")
         print(f"[{player.seat}] Stack: {player.stack}")
         print(f"[{player.seat}] Status: {player.status}")
@@ -226,21 +229,24 @@ def main() -> None:
         print(f"[{player.seat}] Position: {player.position}")
         action_show = player.action if player.action else "—"
         print(f"[{player.seat}] Action: {action_show}")
-        if player.seat == HERO_SEAT and (
-            player.card_left or player.card_right or player.hole_cards
-        ):
-            print(
-                f"[{player.seat}] Hole cards — left: {player.card_left or '—'} | "
-                f"right: {player.card_right or '—'}"
-                + (
-                    f" | combined: {player.hole_cards}"
-                    if player.hole_cards
-                    else ""
+        if player.seat == HERO_SEAT:
+            print(f"[{player.seat}] My turn: {'yes' if player.my_turn else 'no'}")
+            if player.card_left or player.card_right or player.hole_cards:
+                xy = player.hole_xy
+                xy_part = f" ({xy})" if xy else ""
+                print(
+                    f"[{player.seat}] Hole cards — left: {player.card_left or '—'} | "
+                    f"right: {player.card_right or '—'}{xy_part}"
+                    + (
+                        f" | combined: {player.hole_cards}"
+                        if player.hole_cards
+                        else ""
+                    )
                 )
-            )
-        print(
-            f"[{player.seat}] Debug crops: {name_debug_path} , {stack_debug_path}"
-        )
+
+    for line in session.report_lines():
+        print(line)
+    print(f"Saved hand session to: {saved_session}")
 
 
 if __name__ == "__main__":

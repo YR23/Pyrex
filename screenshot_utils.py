@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 from typing import Any, Literal, Union
 
-from consts import HERO_HAND_KEYS, HERO_SEAT
+from consts import HERO_ONLY_CROP_KEYS, HERO_SEAT
 import tkinter as tk
 
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
@@ -296,6 +296,77 @@ def recognize_table_action(action_crop: Image.Image) -> str:
     return ocr_variant(alt)
 
 
+_MY_TURN_WHITELIST = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/0123456789"
+)
+
+_MY_TURN_ALLOWED = frozenset(_MY_TURN_WHITELIST)
+
+
+def _filter_my_turn_chars(raw: str) -> str:
+    """Keep whitelist chars only; preserve case (UI shows **F**old, not all-caps)."""
+    return "".join(c for c in raw if c in _MY_TURN_ALLOWED)
+
+
+def _ocr_my_turn_strip(crop: Image.Image) -> str:
+    """Best-effort OCR for the hero action strip (Fold vs X/F)."""
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    def ocr_variant(gray: Image.Image) -> str:
+        w, h = gray.size
+        scale = max(96 / max(h, 1), 160 / max(w, 1), 3.0)
+        if scale > 1.01:
+            gray = gray.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        best = ""
+        for psm in (6, 7, 8, 11, 13):
+            raw = pytesseract.image_to_string(
+                gray,
+                config=f"--psm {psm} -c tessedit_char_whitelist={_MY_TURN_WHITELIST}",
+            )
+            candidate = _filter_my_turn_chars(raw)
+            if len(candidate) > len(best):
+                best = candidate
+        if not best:
+            for psm in (6, 7, 8, 11, 13):
+                raw = pytesseract.image_to_string(gray, config=f"--psm {psm}")
+                candidate = _filter_my_turn_chars(raw)
+                if len(candidate) > len(best):
+                    best = candidate
+        return best
+
+    gray = crop.convert("L")
+    a = ocr_variant(gray)
+    alt = ImageOps.invert(gray.copy())
+    alt = ImageEnhance.Contrast(alt).enhance(2.0)
+    b = ocr_variant(alt)
+    return a if len(a) >= len(b) else b
+
+
+def detect_hero_my_turn_from_strip(my_turn_crop: Image.Image) -> bool:
+    """Return True when the strip shows an active **Fold** control (hero's turn).
+
+    The label is styled as a capital **F** plus **old** (``Fold``), not all-caps
+    ``FOLD``. When it is not your turn, the same area shows **X/F** (slash).
+    """
+    raw = _ocr_my_turn_strip(my_turn_crop)
+    if not raw:
+        return False
+
+    upper = raw.upper()
+    if "/" in upper or re.search(r"X\s*/\s*F", raw, flags=re.IGNORECASE):
+        return False
+
+    letters_digits = "".join(c for c in raw if c.isalnum())
+    relaxed = letters_digits.replace("0", "O").replace("I", "L")
+    return bool(re.search(r"fold", relaxed, flags=re.IGNORECASE))
+
+
 _HOLE_CARD_WHITELIST = "0123456789AKQJTSHDC"
 
 
@@ -458,7 +529,7 @@ def load_crop_regions_config(
         for extra_key, extra_val in value.items():
             if extra_key in ("name", "stack"):
                 continue
-            if extra_key in HERO_HAND_KEYS and key != HERO_SEAT:
+            if extra_key in HERO_ONLY_CROP_KEYS and key != HERO_SEAT:
                 continue
             if isinstance(extra_val, dict) and all(
                 c in extra_val for c in ("x0", "y0", "x1", "y1")

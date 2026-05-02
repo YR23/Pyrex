@@ -18,6 +18,46 @@ SEAT_ORDER_CLOCKWISE = (
 SIX_MAX_POSITIONS = ("BTN", "SB", "BB", "UTG", "MP", "CO")
 
 
+def _split_rank_color(card: str) -> tuple[str, str]:
+    """Parse ``{rank}-{color}`` from a single hole crop label."""
+    s = card.strip()
+    if not s:
+        return "", ""
+    if "-" not in s:
+        return s, ""
+    rank, color = s.rsplit("-", 1)
+    return rank.strip(), color.strip()
+
+
+def _rank_for_xy_notation(rank: str) -> str:
+    """Shorthand rank for ``XYz`` (ten → ``T``)."""
+    if rank == "10":
+        return "T"
+    return rank
+
+
+def format_hole_xy(card_left: str, card_right: str) -> str:
+    """Hole cards as ``XYz``: left rank ``X``, right rank ``Y``, suffix ``z``.
+
+    ``z`` is ``s`` if both non-pair cards share the same dominant color (suited),
+    ``o`` if ranks differ and colors differ or color is unknown, and ``""`` for a
+    pocket pair (same rank).
+
+    Returns ``""`` if either side is missing.
+    """
+    lr, lc = _split_rank_color(card_left)
+    rr, rc = _split_rank_color(card_right)
+    if not lr or not rr:
+        return ""
+    xl = _rank_for_xy_notation(lr)
+    yr = _rank_for_xy_notation(rr)
+    if lr == rr:
+        return f"{xl}{yr}"
+    if lc and rc and lc == rc:
+        return f"{xl}{yr}s"
+    return f"{xl}{yr}o"
+
+
 @dataclass
 class Player:
     """One player seat: name, stack, active styling, dealer chip, and table position."""
@@ -32,6 +72,7 @@ class Player:
     card_left: str = ""
     card_right: str = ""
     hole_cards: str = ""
+    my_turn: bool = False
 
     @property
     def status(self) -> str:
@@ -42,6 +83,11 @@ class Player:
         if not self.active:
             return "FOLD"
         return ""
+
+    @property
+    def hole_xy(self) -> str:
+        """``XYz`` shorthand from ``card_left`` / ``card_right`` (see ``format_hole_xy``)."""
+        return format_hole_xy(self.card_left, self.card_right)
 
 
 def assign_six_max_positions(players: list[Player]) -> None:
