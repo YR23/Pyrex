@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 import subprocess
-from typing import Literal, Union
+from typing import Any, Literal, Union
 import tkinter as tk
 
 from PIL import Image, ImageEnhance, ImageOps, ImageTk
@@ -119,6 +119,56 @@ def crop_from_loaded_image(
     return image.crop((x0, y0, x1, y1))
 
 
+def is_player_name_active(
+    name_image: Image.Image,
+    *,
+    luminance_peak_threshold: int = 200,
+) -> bool:
+    """Whether the name label looks like the bright-white \"active\" style.
+
+    CoinPoker-style UI: acting player names reach true white (luminance 255);
+    folded / waiting seats use dimmed text capped around 128. We use the
+    brightest grayscale value in the crop as a simple discriminator.
+    """
+    gray = name_image.convert("L")
+    hist = gray.histogram()
+    peak = max(i for i, count in enumerate(hist) if count)
+    return peak >= luminance_peak_threshold
+
+
+def detect_dealer_marker(dealer_crop: Image.Image) -> bool:
+    """Return True if a ``D`` dealer button is visible in the crop (OCR, letter only)."""
+    try:
+        import pytesseract
+    except ImportError:
+        return False
+
+    def ocr_d(gray: Image.Image) -> bool:
+        w, h = gray.size
+        scale = max(64 / max(h, 1), 64 / max(w, 1), 2.0)
+        if scale > 1.01:
+            gray = gray.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        for psm in (10, 7):
+            raw = pytesseract.image_to_string(
+                gray,
+                config=f"--psm {psm} -c tessedit_char_whitelist=D",
+            ).strip()
+            if "D" in raw.upper():
+                return True
+        return False
+
+    gray = dealer_crop.convert("L")
+    if ocr_d(gray):
+        return True
+    # Fallback: inverted contrast (some table themes differ)
+    alt = ImageOps.invert(gray.copy())
+    alt = ImageEnhance.Contrast(alt).enhance(1.8)
+    return ocr_d(alt)
+
+
 def pick_crop_coordinates(
     source_path: str | Path = "monitor_screenshot.png",
 ) -> tuple[int, int, int, int]:
@@ -204,12 +254,12 @@ def _parse_rect(region: object, path_hint: str) -> tuple[int, int, int, int]:
 
 def load_crop_regions_config(
     json_path: str | Path,
-) -> tuple[str, dict[str, dict[str, tuple[int, int, int, int]]]]:
-    """Load ``crop_regions.json`` with per-seat ``name`` and ``stack`` rectangles.
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """Load ``crop_regions.json`` with per-seat ``name``, ``stack``, optional ``dealer``.
 
     Top-level ``source_image`` (default ``monitor_screenshot.png``). Every other
-    top-level object is a *seat* (e.g. ``top_left``) containing ``name`` and ``stack``,
-    each with ``x0``, ``y0``, ``x1``, ``y1``.
+    top-level object is a *seat* with required ``name`` and ``stack`` rects; optional
+    ``dealer`` rect is used to OCR a ``D`` dealer button for that seat.
     """
     path = Path(json_path).expanduser().resolve()
     if not path.exists():
@@ -218,7 +268,7 @@ def load_crop_regions_config(
     data = json.loads(path.read_text(encoding="utf-8"))
     source = str(data.get("source_image", "monitor_screenshot.png"))
 
-    seats: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+    seats: dict[str, dict[str, Any]] = {}
     for key, value in data.items():
         if key == "source_image":
             continue
@@ -226,10 +276,13 @@ def load_crop_regions_config(
             raise TypeError(f"Seat '{key}' must be an object with name and stack")
         if "name" not in value or "stack" not in value:
             raise KeyError(f"Seat '{key}' must include 'name' and 'stack'")
-        seats[key] = {
+        seat: dict[str, Any] = {
             "name": _parse_rect(value["name"], f"{key}.name"),
             "stack": _parse_rect(value["stack"], f"{key}.stack"),
         }
+        if "dealer" in value:
+            seat["dealer"] = _parse_rect(value["dealer"], f"{key}.dealer")
+        seats[key] = seat
 
     if not seats:
         raise ValueError(

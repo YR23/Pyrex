@@ -1,16 +1,21 @@
 """Read crop regions from JSON, OCR — or interactively pick coordinates on the image."""
 
 import argparse
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
 
+from player import Player, assign_six_max_positions
 from screenshot_utils import (
     crop_from_loaded_image,
+    detect_dealer_marker,
+    is_player_name_active,
     load_crop_regions_config,
     pick_crop_coordinates,
     recognize_text_from_image,
+    screenshot_entire_monitor,
 )
 
 
@@ -27,25 +32,47 @@ def _pick_and_print(source_path: Path, label: str) -> tuple[int, int, int, int]:
 def _process_one_seat(
     base: Image.Image,
     seat_label: str,
-    regions: dict[str, tuple[int, int, int, int]],
+    regions: dict,
     debug_dir: Path,
-) -> tuple[str, str, str, Path, Path]:
-    """Crop one seat, OCR name/stack, save debug PNGs (safe to run in parallel threads)."""
+    crop_lock: threading.Lock,
+) -> tuple[Player, Path, Path]:
+    """Crop one seat, OCR name/stack, optional dealer marker, save debug PNGs."""
+
+    def safe_crop(x0: int, y0: int, x1: int, y1: int) -> Image.Image:
+        with crop_lock:
+            return crop_from_loaded_image(base, x0, y0, x1, y1)
+
     nx0, ny0, nx1, ny1 = regions["name"]
     sx0, sy0, sx1, sy1 = regions["stack"]
 
-    name_image = crop_from_loaded_image(base, nx0, ny0, nx1, ny1)
-    stack_image = crop_from_loaded_image(base, sx0, sy0, sx1, sy1)
+    name_image = safe_crop(nx0, ny0, nx1, ny1)
+    stack_image = safe_crop(sx0, sy0, sx1, sy1)
 
     player_name = recognize_text_from_image(name_image, kind="name")
     stack = recognize_text_from_image(stack_image, kind="stack")
+    active = is_player_name_active(name_image)
+
+    dealer = False
+    dealer_rect = regions.get("dealer")
+    if dealer_rect is not None:
+        dx0, dy0, dx1, dy1 = dealer_rect
+        dealer_image = safe_crop(dx0, dy0, dx1, dy1)
+        dealer = detect_dealer_marker(dealer_image)
+        dealer_image.save(debug_dir / f"{seat_label}_dealer.png")
 
     name_debug_path = debug_dir / f"{seat_label}_name.png"
     stack_debug_path = debug_dir / f"{seat_label}_stack.png"
     name_image.save(name_debug_path)
     stack_image.save(stack_debug_path)
 
-    return seat_label, player_name, stack, name_debug_path, stack_debug_path
+    player = Player(
+        seat=seat_label,
+        name=player_name,
+        stack=stack,
+        active=active,
+        dealer=dealer,
+    )
+    return player, name_debug_path, stack_debug_path
 
 
 def main() -> None:
@@ -65,6 +92,17 @@ def main() -> None:
         type=str,
         default="monitor_screenshot.png",
         help="Screenshot file to use with --pick / --pick-both (relative to this folder).",
+    )
+    parser.add_argument(
+        "--monitor",
+        type=int,
+        default=2,
+        help="Display index for screencapture -D when capturing (default: 2 = first external).",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Skip monitor capture; use existing source_image from disk.",
     )
     args = parser.parse_args()
 
@@ -90,6 +128,10 @@ def main() -> None:
     source_rel, seats = load_crop_regions_config(config_path)
     image_path = repo_root / source_rel
 
+    if not args.no_capture:
+        captured = screenshot_entire_monitor(image_path, monitor_index=args.monitor)
+        print(f"Captured monitor to: {captured}")
+
     with Image.open(image_path) as monitor_image:
         base = monitor_image.copy()
 
@@ -98,17 +140,31 @@ def main() -> None:
 
     seat_items = list(seats.items())
     max_workers = min(8, len(seat_items)) if seat_items else 1
+    crop_lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [
-            pool.submit(_process_one_seat, base, seat_label, regions, debug_dir)
+            pool.submit(
+                _process_one_seat, base, seat_label, regions, debug_dir, crop_lock
+            )
             for seat_label, regions in seat_items
         ]
-        for fut in futures:
-            seat_label, player_name, stack, name_debug_path, stack_debug_path = fut.result()
-            print(f"[{seat_label}] Player: {player_name}")
-            print(f"[{seat_label}] Stack: {stack}")
-            print(f"[{seat_label}] Debug crops: {name_debug_path} , {stack_debug_path}")
+        rows: list[tuple[Player, Path, Path]] = [fut.result() for fut in futures]
+
+    players = [p for p, _, _ in rows]
+    assign_six_max_positions(players)
+
+    for player, name_debug_path, stack_debug_path in rows:
+        print(f"[{player.seat}] Player: {player.name}")
+        print(f"[{player.seat}] Stack: {player.stack}")
+        print(f"[{player.seat}] Status: {player.status}")
+        action_display = player.last_action if player.last_action else "—"
+        print(f"[{player.seat}] Last action: {action_display}")
+        print(f"[{player.seat}] Dealer: {player.dealer}")
+        print(f"[{player.seat}] Position: {player.position}")
+        print(
+            f"[{player.seat}] Debug crops: {name_debug_path} , {stack_debug_path}"
+        )
 
 
 if __name__ == "__main__":
