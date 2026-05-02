@@ -286,7 +286,34 @@ def _merge_stack_ocr_candidates(enhanced: str, simple: str) -> str:
         return a
     if score_b > score_a:
         return b
-    return a
+    # Tie: prefer simple — enhanced prep can be empty or wrong on some crops (e.g. lone digit).
+    return b
+
+
+def _ocr_stack_last_resort(image: Image.Image) -> str:
+    """When merged stack OCR is empty, try heavy upscale + alternate page modes."""
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    gray = image.convert("L")
+    w, h = gray.size
+    scale = max(4.0, 100 / max(h, 1), 320 / max(w, 1))
+    big = gray.resize(
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    for cfg in (
+        "--psm 10 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 7 -c tessedit_char_whitelist=0123456789.,",
+        "--psm 10",
+    ):
+        raw = pytesseract.image_to_string(big, config=cfg).strip()
+        s = _normalize_stack_string(raw)
+        if s and re.fullmatch(r"[\d.]+", s) and s != ".":
+            return s
+    return ""
 
 
 def recognize_text_from_image(
@@ -332,8 +359,9 @@ def recognize_text_from_image(
 
         gray_simple = image.convert("L")
         ws, hs = gray_simple.size
-        if ws < 120 or hs < 24:
-            scale = max(120 / ws, 24 / hs, 2.0)
+        # Short stack strips (e.g. hero chip count) need upscale even when width >= 120.
+        if ws < 120 or hs < 24 or hs < 72:
+            scale = max(120 / max(ws, 1), 24 / max(hs, 1), 72 / max(hs, 1), 2.0)
             gray_simple = gray_simple.resize(
                 (max(1, int(ws * scale)), max(1, int(hs * scale))),
                 Image.Resampling.LANCZOS,
@@ -341,7 +369,12 @@ def recognize_text_from_image(
         simple_out = pytesseract.image_to_string(
             gray_simple, config=stack_config_simple
         ).strip()
-        return _merge_stack_ocr_candidates(text_out, simple_out)
+
+        merged = _merge_stack_ocr_candidates(text_out, simple_out)
+        norm = _normalize_stack_string(merged)
+        if norm and _stack_ocr_score(norm)[0] >= 0:
+            return norm
+        return _ocr_stack_last_resort(image)
 
     if w < 120 or h < 24:
         scale = max(120 / w, 24 / h, 2.0)

@@ -1,6 +1,7 @@
 """Read crop regions from JSON, OCR — or interactively pick coordinates on the image."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from PIL import Image
@@ -21,6 +22,30 @@ def _pick_and_print(source_path: Path, label: str) -> tuple[int, int, int, int]:
         f'  JSON: "{label}": {{"x0": {x0}, "y0": {y0}, "x1": {x1}, "y1": {y1}}},'
     )
     return x0, y0, x1, y1
+
+
+def _process_one_seat(
+    base: Image.Image,
+    seat_label: str,
+    regions: dict[str, tuple[int, int, int, int]],
+    debug_dir: Path,
+) -> tuple[str, str, str, Path, Path]:
+    """Crop one seat, OCR name/stack, save debug PNGs (safe to run in parallel threads)."""
+    nx0, ny0, nx1, ny1 = regions["name"]
+    sx0, sy0, sx1, sy1 = regions["stack"]
+
+    name_image = crop_from_loaded_image(base, nx0, ny0, nx1, ny1)
+    stack_image = crop_from_loaded_image(base, sx0, sy0, sx1, sy1)
+
+    player_name = recognize_text_from_image(name_image, kind="name")
+    stack = recognize_text_from_image(stack_image, kind="stack")
+
+    name_debug_path = debug_dir / f"{seat_label}_name.png"
+    stack_debug_path = debug_dir / f"{seat_label}_stack.png"
+    name_image.save(name_debug_path)
+    stack_image.save(stack_debug_path)
+
+    return seat_label, player_name, stack, name_debug_path, stack_debug_path
 
 
 def main() -> None:
@@ -71,24 +96,19 @@ def main() -> None:
     debug_dir = repo_root / "debug_crops"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    for seat_label, regions in seats.items():
-        nx0, ny0, nx1, ny1 = regions["name"]
-        sx0, sy0, sx1, sy1 = regions["stack"]
+    seat_items = list(seats.items())
+    max_workers = min(8, len(seat_items)) if seat_items else 1
 
-        name_image = crop_from_loaded_image(base, nx0, ny0, nx1, ny1)
-        stack_image = crop_from_loaded_image(base, sx0, sy0, sx1, sy1)
-
-        player_name = recognize_text_from_image(name_image, kind="name")
-        stack = recognize_text_from_image(stack_image, kind="stack")
-
-        name_debug_path = debug_dir / f"{seat_label}_name.png"
-        stack_debug_path = debug_dir / f"{seat_label}_stack.png"
-        name_image.save(name_debug_path)
-        stack_image.save(stack_debug_path)
-
-        print(f"[{seat_label}] Player: {player_name}")
-        print(f"[{seat_label}] Stack: {stack}")
-        print(f"[{seat_label}] Debug crops: {name_debug_path} , {stack_debug_path}")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [
+            pool.submit(_process_one_seat, base, seat_label, regions, debug_dir)
+            for seat_label, regions in seat_items
+        ]
+        for fut in futures:
+            seat_label, player_name, stack, name_debug_path, stack_debug_path = fut.result()
+            print(f"[{seat_label}] Player: {player_name}")
+            print(f"[{seat_label}] Stack: {stack}")
+            print(f"[{seat_label}] Debug crops: {name_debug_path} , {stack_debug_path}")
 
 
 if __name__ == "__main__":
