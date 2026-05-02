@@ -14,6 +14,7 @@ from screenshot_utils import (
     is_player_name_active,
     load_crop_regions_config,
     pick_crop_coordinates,
+    recognize_table_action,
     recognize_text_from_image,
     screenshot_entire_monitor,
 )
@@ -60,6 +61,14 @@ def _process_one_seat(
         dealer = detect_dealer_marker(dealer_image)
         dealer_image.save(debug_dir / f"{seat_label}_dealer.png")
 
+    action = ""
+    action_rect = regions.get("action")
+    if action_rect is not None:
+        ax0, ay0, ax1, ay1 = action_rect
+        action_image = safe_crop(ax0, ay0, ax1, ay1)
+        action = recognize_table_action(action_image)
+        action_image.save(debug_dir / f"{seat_label}_action.png")
+
     name_debug_path = debug_dir / f"{seat_label}_name.png"
     stack_debug_path = debug_dir / f"{seat_label}_stack.png"
     name_image.save(name_debug_path)
@@ -71,6 +80,7 @@ def _process_one_seat(
         stack=stack,
         active=active,
         dealer=dealer,
+        action=action,
     )
     return player, name_debug_path, stack_debug_path
 
@@ -100,26 +110,30 @@ def main() -> None:
         help="Display index for screencapture -D when capturing (default: 2 = first external).",
     )
     parser.add_argument(
-        "--no-capture",
+        "--capture",
         action="store_true",
-        help="Skip monitor capture; use existing source_image from disk.",
+        help="Take a fresh monitor screenshot before OCR or --pick (default: use file on disk).",
     )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
     source_path = (repo_root / args.image).resolve()
 
-    if args.pick_both:
-        nx0, ny0, nx1, ny1 = _pick_and_print(source_path, "name")
-        sx0, sy0, sx1, sy1 = _pick_and_print(source_path, "stack")
-        print(
-            'Paste under a seat key, e.g. "top_left": '
-            f'{{ "name": {{"x0": {nx0}, "y0": {ny0}, "x1": {nx1}, "y1": {ny1}}}, '
-            f'"stack": {{"x0": {sx0}, "y0": {sy0}, "x1": {sx1}, "y1": {sy1}}} }},'
-        )
-        return
-
-    if args.pick:
+    if args.pick_both or args.pick:
+        if args.capture:
+            captured = screenshot_entire_monitor(
+                source_path, monitor_index=args.monitor
+            )
+            print(f"Captured monitor to: {captured}")
+        if args.pick_both:
+            nx0, ny0, nx1, ny1 = _pick_and_print(source_path, "name")
+            sx0, sy0, sx1, sy1 = _pick_and_print(source_path, "stack")
+            print(
+                'Paste under a seat key, e.g. "top_left": '
+                f'{{ "name": {{"x0": {nx0}, "y0": {ny0}, "x1": {nx1}, "y1": {ny1}}}, '
+                f'"stack": {{"x0": {sx0}, "y0": {sy0}, "x1": {sx1}, "y1": {sy1}}} }},'
+            )
+            return
         _pick_and_print(source_path, "region")
         print('Paste under a seat as "name" or "stack", e.g. top_left.name.')
         return
@@ -128,7 +142,7 @@ def main() -> None:
     source_rel, seats = load_crop_regions_config(config_path)
     image_path = repo_root / source_rel
 
-    if not args.no_capture:
+    if args.capture:
         captured = screenshot_entire_monitor(image_path, monitor_index=args.monitor)
         print(f"Captured monitor to: {captured}")
 
@@ -162,6 +176,8 @@ def main() -> None:
         print(f"[{player.seat}] Last action: {action_display}")
         print(f"[{player.seat}] Dealer: {player.dealer}")
         print(f"[{player.seat}] Position: {player.position}")
+        action_show = player.action if player.action else "—"
+        print(f"[{player.seat}] Action: {action_show}")
         print(
             f"[{player.seat}] Debug crops: {name_debug_path} , {stack_debug_path}"
         )

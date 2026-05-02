@@ -169,6 +169,57 @@ def detect_dealer_marker(dealer_crop: Image.Image) -> bool:
     return ocr_d(alt)
 
 
+_ACTION_CHAR_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+
+
+def _normalize_action_ocr(raw: str) -> str:
+    """Keep only A–Z and hyphen (e.g. ``ALL-IN``); uppercase."""
+    allowed = frozenset(_ACTION_CHAR_WHITELIST)
+    return "".join(c for c in raw.upper() if c in allowed)
+
+
+def recognize_table_action(action_crop: Image.Image) -> str:
+    """Read action label: capital letters and ``-`` only (e.g. ``ALL-IN``); strip other chars."""
+
+    try:
+        import pytesseract
+    except ImportError:
+        return ""
+
+    def ocr_variant(gray: Image.Image) -> str:
+        w, h = gray.size
+        scale = max(72 / max(h, 1), 100 / max(w, 1), 3.0)
+        if scale > 1.01:
+            gray = gray.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        best = ""
+        for psm in (7, 8):
+            raw = pytesseract.image_to_string(
+                gray,
+                config=f"--psm {psm} -c tessedit_char_whitelist={_ACTION_CHAR_WHITELIST}",
+            )
+            candidate = _normalize_action_ocr(raw)
+            if len(candidate) > len(best):
+                best = candidate
+        if not best:
+            for psm in (7, 8):
+                raw = pytesseract.image_to_string(gray, config=f"--psm {psm}")
+                candidate = _normalize_action_ocr(raw)
+                if len(candidate) > len(best):
+                    best = candidate
+        return best
+
+    gray = action_crop.convert("L")
+    out = ocr_variant(gray)
+    if out:
+        return out
+    alt = ImageOps.invert(gray.copy())
+    alt = ImageEnhance.Contrast(alt).enhance(2.0)
+    return ocr_variant(alt)
+
+
 def pick_crop_coordinates(
     source_path: str | Path = "monitor_screenshot.png",
 ) -> tuple[int, int, int, int]:
@@ -255,11 +306,11 @@ def _parse_rect(region: object, path_hint: str) -> tuple[int, int, int, int]:
 def load_crop_regions_config(
     json_path: str | Path,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Load ``crop_regions.json`` with per-seat ``name``, ``stack``, optional ``dealer``.
+    """Load ``crop_regions.json`` with per-seat ``name``, ``stack``, optional ``dealer`` / ``action``.
 
     Top-level ``source_image`` (default ``monitor_screenshot.png``). Every other
     top-level object is a *seat* with required ``name`` and ``stack`` rects; optional
-    ``dealer`` rect is used to OCR a ``D`` dealer button for that seat.
+    ``dealer`` and ``action`` rects for dealer chip and action text (caps + ``-``).
     """
     path = Path(json_path).expanduser().resolve()
     if not path.exists():
@@ -282,6 +333,8 @@ def load_crop_regions_config(
         }
         if "dealer" in value:
             seat["dealer"] = _parse_rect(value["dealer"], f"{key}.dealer")
+        if "action" in value:
+            seat["action"] = _parse_rect(value["action"], f"{key}.action")
         seats[key] = seat
 
     if not seats:

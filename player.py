@@ -28,6 +28,7 @@ class Player:
     active: bool
     dealer: bool = False
     position: str = "?"
+    action: str = ""
 
     @property
     def status(self) -> str:
